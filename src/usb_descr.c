@@ -37,8 +37,8 @@ static const uint8_t vcom_device_descriptor_data[18] = {
   USB_DESC_DEVICE       (0x0200,        /* bcdUSB (1.1).                    */
 		  	  	  	  	  0xFF,0xFF,0xFF,
                          0x40,          /* bMaxPacketSize.                  */
-						 0x0403,        /* idVendor (ST).                   */
-						 0x0000,        /* idProduct.                       */
+						 0x1c40,        /* idVendor (ST).                   */
+						 0x0534,        /* idProduct.                       */
                          0x0900,        /* bcdDevice.                       */
                          1,             /* iManufacturer.                   */
                          2,             /* iProduct.                        */

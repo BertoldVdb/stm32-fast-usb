@@ -12,21 +12,14 @@
 #include "usb_hal.h"
 #include "chip.h"
 
-	/* This data is used by the assembler code in the interrupt handler to update the buffer ASAP
-	 * 0: EP config ram addr (buftx, lentx, bufrx, lenrx)
-	 * 1: EP reg ptr
-	 * 2: 32 bit value that goes to buftx (bottom 16), lentx (top 16) -> 0 if no fastpath
-	 * 3: EP reg update value for txack
-	 * 4: value that goes to bufrx
-	 * 5: EP reg update value for rxack */
-
+/* This data is used by the assembler code in the interrupt handler to update the buffer ASAP */
 #define USB_FASTPATH_EPCONFIGPTR 0
 #define USB_FASTPATH_TX 1
 #define USB_FASTPATH_RXTXACK 2
 #define USB_FASTPATH_RX 3
 
 static volatile uint16_t* endpointRegister(USBEndpoint* ep){
-	return ((volatile uint16_t*)USB) + 2*ep->index;
+	return ((volatile uint16_t*)ep->ctrl->usbDevice) + 2*ep->index;
 }
 
 static void usbAbort(){
@@ -67,13 +60,12 @@ static uint8_t endpointBufferIndexIncrement(USBEndpoint* ep, uint8_t direction){
 	return tmp;
 }
 
+#ifdef CONFIG_USB_HAL_STM32_USE_FASTPATH
 static void endpointFastPathConfigureNextBuffer(USBEndpoint* ep, uint8_t direction, uint8_t doMore){
 	uint32_t* fp = ep->ctrl->trxFastPathArray + 4*ep->index;
 
 	uint8_t nextIndex = endpointBufferIndexIncrement(ep, direction);
 	uint32_t newBuf = ep->trxBufAddr[direction][nextIndex];
-
-
 
 	if(direction == 0){
 		uint32_t newLen = ep->txBufLen[nextIndex];
@@ -96,37 +88,20 @@ static void endpointFastPathConfigureNextBuffer(USBEndpoint* ep, uint8_t directi
 		fp[USB_FASTPATH_RXTXACK] = (fp[USB_FASTPATH_RXTXACK] & 0xFFFF) | (rxAck << 16);
 	}
 }
+#else
+static void endpointBufferUpdate(USBEndpoint* ep, uint8_t direction){
+	ep->ctrl->bufferRam[4*ep->index + 2*direction + 0] =
+			ep->trxBufAddr[direction][ep->trxBufIndex[direction]];
+}
 
-//static void endpointBufferUpdatePrepare(USBEndpoint* ep, uint8_t direction){
-//	uint8_t newIndex = endpointBufferIndexIncrement(ep, direction);
-//	uint32_t newBuf = ep->trxBufAddr[direction][newIndex];
-//
-//	if(direction == 0){
-//		uint32_t* fp = ep->ctrl->trxFastPathArray + 8*ep->index;
-//		fp[USB_FASTPATH_TXACK] = ep->epRegBase | USB_EP_CTR_RX; /* Ack tx */
-//
-//		if(ep->txBufNumActive){
-//			uint32_t newLen = ep->txBufLen[ep->trxBufIndex[0]];
-//			fp[USB_FASTPATH_TX] = newBuf | (newLen << 16);
-//			fp[USB_FASTPATH_TXACK] |= (1<<4); //Start a new transfer: NAK->VALID
-//		}
-//	}
-//}
-
+static uint16_t endpointBufferGetLen(USBEndpoint* ep, uint8_t direction){
+	return ep->ctrl->bufferRam[4*ep->index + 2*direction + 1] & 0x3FF;
+}
+#endif
 
 static void endpointBufferSetTXLen(USBEndpoint* ep, uint16_t len){
 	ep->ctrl->bufferRam[4*ep->index+1] = len;
 }
-
-/*static void endpointBufferUpdate(USBEndpoint* ep, uint8_t direction){
-	ep->trxBufIndex[direction]++;
-	if(ep->trxBufIndex[direction] == ep->trxBufNum[direction]){
-		ep->trxBufIndex[direction] = 0;
-	}
-
-	ep->ctrl->bufferRam[4*ep->index + 2*direction + 0] =
-			ep->trxBufAddr[direction][ep->trxBufIndex[direction]];
-}*/
 
 static volatile uint16_t* endpointBufferGetAddress(USBEndpoint* ep, uint8_t direction, int8_t bufIndex){
 	if(bufIndex < 0){
@@ -135,11 +110,6 @@ static volatile uint16_t* endpointBufferGetAddress(USBEndpoint* ep, uint8_t dire
 	uint16_t start = ep->trxBufAddr[direction][bufIndex];
 	return ep->ctrl->bufferRam + (start>>1);
 }
-
-//static uint16_t endpointBufferGetLen(USBEndpoint* ep, uint8_t direction){
-//	return ep->ctrl->bufferRam[4*ep->index + 2*direction + 1] & 0x1FF;
-//}
-
 
 static void endpointStateSet(USBEndpoint* ep, USBEndpointState wantedRx, USBEndpointState wantedTx){
 	volatile uint16_t* reg = endpointRegister(ep);
@@ -198,7 +168,7 @@ static void endpointReset(USBController* ctrl, uint8_t makeNew){
 static void usbReset(USBController* ctrl){
 	endpointReset(ctrl, 1);
 
-	USB->DADDR = 1<<7;
+	ctrl->usbDevice->DADDR = 1<<7;
 }
 
 static void usbHandleTransferTX(USBEndpoint* ep){
@@ -206,7 +176,17 @@ static void usbHandleTransferTX(USBEndpoint* ep){
 	ep->trxBufIndex[0] = endpointBufferIndexIncrement(ep, 0);
 
 	ep->txBufNumActive--;
+#ifdef CONFIG_USB_HAL_STM32_USE_FASTPATH
 	endpointFastPathConfigureNextBuffer(ep, 0, ep->txBufNumActive>=2);
+#else
+	endpointBufferUpdate(ep, 0);
+	*endpointRegister(ep) = ep->epRegBase & ~USB_EP_CTR_TX;
+
+	if(ep->txBufNumActive >= 1){
+		endpointBufferSetTXLen(ep, ep->txBufLen[ep->trxBufIndex[0]]);
+		USBEndpointTransmitSetState(ep, USBEP_STATE_VALID);
+	}
+#endif
 
 	USBTransmitCallback txCb = ep->txCb;
 	if(txCb){
@@ -218,8 +198,12 @@ static void usbHandleTransferRX(USBEndpoint* ep, uint32_t epState){
 	USBEndpointBuffer* buf = ep->rxBuf[ep->trxBufIndex[1]];
 	ep->rxBuf[ep->trxBufIndex[1]] = NULL;
 
+#ifdef CONFIG_USB_HAL_STM32_USE_FASTPATH
 	buf->len = (epState >> 16) & 0x3FF;
 	epState &= 0xFFFF;
+#else
+	buf->len = endpointBufferGetLen(ep, 1);
+#endif
 
 	buf->flags = 0;
 
@@ -227,13 +211,18 @@ static void usbHandleTransferRX(USBEndpoint* ep, uint32_t epState){
 
 	ep->rxBufNumActive--;
 
+#ifdef CONFIG_USB_HAL_STM32_USE_FASTPATH
 	endpointFastPathConfigureNextBuffer(ep, 1, ep->rxBufNumActive>=2);
+#else
+	endpointBufferUpdate(ep, 1);
+	*endpointRegister(ep) = ep->epRegBase & ~USB_EP_CTR_RX;
+
+	if(ep->rxBufNumActive >= 1){
+		USBEndpointReceiveSetState(ep, USBEP_STATE_VALID);
+	}
+#endif
 
 	if(buf->cb){
-		//if (ep->trxBufNum[1] > 1){
-		//	buffer.flags |= USBEP_FLAGS_IS_SAFE_CONCURRENT;
-		//}
-
 		if ((ep->type == USBEP_TYPE_CONTROL) && (epState & USB_EP_SETUP)){
 			buf->flags |= USBEP_FLAGS_IS_SETUP;
 		}
@@ -256,19 +245,19 @@ int USBControllerInit(USBController* ctrl){
 void USBControllerStart(USBController* ctrl, USBResetCallback resetCb){
 	ctrl->resetCb = resetCb;
 
-	USB->BTABLE = 0;
-	USB->CNTR = USB_CNTR_CTRM | USB_CNTR_RESETM;
+	ctrl->usbDevice->BTABLE = 0;
+	ctrl->usbDevice->CNTR = USB_CNTR_CTRM | USB_CNTR_RESETM;
 
 	/* Plug in cable */
-	USB->BCDR = 1<<15;
+	ctrl->usbDevice->BCDR = 1<<15;
 }
 
 void USBControllerStop(USBController* ctrl){
 	endpointReset(ctrl, 0);
 
-	USB->BCDR = 0;
-	USB->DADDR = 0;
-	USB->CNTR = 3;
+	ctrl->usbDevice->BCDR = 0;
+	ctrl->usbDevice->DADDR = 0;
+	ctrl->usbDevice->CNTR = 3;
 }
 /* 0: EP config ram addr (buftx, lentx, bufrx, lenrx)
 * 1: 32 bit value that goes to buftx (bottom 16), lentx (top 16) -> 0 if no fastpath
@@ -277,16 +266,14 @@ void USBControllerStop(USBController* ctrl){
 */
 void USBControllerIRQ(USBController* ctrl){
 	uint16_t isr = ctrl->usbDevice->ISTR;
+	uint32_t epState;
 
+#ifdef CONFIG_USB_HAL_STM32_USE_FASTPATH
 	//ASM version of fastpath code
-	uint32_t fpAddr, epIndex, work1, work2, work3 = (uint32_t)ctrl->usbDevice, epState;
+	uint32_t fpAddr, epIndex, work1, work2, work3 = (uint32_t)ctrl->usbDevice;
 	asm volatile (
 		//Testing CTR can be skipped, since we check the epState
 		"mov %[epIndex], %[isr]\n"
-
-	//	"mov %[work1], %[isr]\n" //work1=epState
-	//	"lsr %[work1], #16\n" //work1>>=16 (CTR_RX goes to carry)
-	//	"bcc done%=\n" //if c==0 -> done
 
 		"lsl %[epIndex], #29\n" // Shift rightmost 3 bits to 31-30-29
 		"lsr %[epIndex], #27\n" // Shift last 3 bits to 4-3-2
@@ -307,7 +294,6 @@ void USBControllerIRQ(USBController* ctrl){
 		"ldr %[work2], [%[fpAddr], #12]\n" //USB_FASTPATH_RX -> work2
 		"strh %[work2], [%[work1], #4]\n"  //work2 -> config[2]
 		"ldrh %[work2], [%[work1], #6]\n"  //config[3] -> work2
-		//"str %[work2], [%[fpAddr], #24]\n"
 		"lsl %[work2], #16\n"              //work2 -> 16 high bits of epState
 		"orr %[epState], %[work2] \n"
 		"ldr %[work2], [%[fpAddr], #8]\n" //USB_FASTPATH_RXTXACK (high 16 bits)
@@ -333,30 +319,31 @@ void USBControllerIRQ(USBController* ctrl){
 		: [fpAddr]"=&l"(fpAddr), [epIndex]"=&l"(epIndex), [work1]"=&l"(work1), [work2]"=&l"(work2), [work3]"+&l"(work3), [epState]"=&l"(epState)
 		: [isr]"l"(isr), [fp]"l"(ctrl->trxFastPathArray)
 		: "memory");
+#endif
 
-	//ctrl->usbDevice->ISTR = ~isr;
+	USBEndpoint* ep = &ctrl->endpoints[isr&7];
 
-	//if (isr & USB_ISTR_CTR){
-	//	halUartHex16(isr);
-		epIndex = isr&7;
-		USBEndpoint* ep = &ctrl->endpoints[epIndex];
-
-		if(epState & USB_EP_CTR_RX){
-			usbHandleTransferRX(ep, epState);
-		}
-		if(epState & USB_EP_CTR_TX){
-			usbHandleTransferTX(ep);
-		}
-	//}
+#ifndef CONFIG_USB_HAL_STM32_USE_FASTPATH
+	epState = *endpointRegister(ep);
+#endif
 
 	if (isr & USB_ISTR_RESET){
 		ctrl->usbDevice->ISTR &= ~USB_ISTR_RESET;
 		usbReset(ctrl);
+		return;
+	}
+
+	if(epState & USB_EP_CTR_RX){
+		usbHandleTransferRX(ep, epState);
+	}
+
+	if(epState & USB_EP_CTR_TX){
+		usbHandleTransferTX(ep);
 	}
 }
 
 void USBControllerSetAddress(USBController* ctrl, uint8_t addr){
-	USB->DADDR = addr | (1<<7);
+	ctrl->usbDevice->DADDR = addr | (1<<7);
 }
 
 USBEndpoint* USBControllerEndpointAlloc(USBController* ctrl,
@@ -387,15 +374,18 @@ USBEndpoint* USBControllerEndpointAlloc(USBController* ctrl,
 
 	ep->epRegBase = base;
 
+	endpointBufferAlloc(ep, 0, txBufSize);
+	endpointBufferAlloc(ep, 1, rxBufSize);
+
+#ifdef CONFIG_USB_HAL_STM32_USE_FASTPATH
 	/* Cache this to handle the IRQ faster */
 	uint32_t* fp = ep->ctrl->trxFastPathArray + 4*ep->index;
 	fp[USB_FASTPATH_EPCONFIGPTR] = (uint32_t)&ep->ctrl->bufferRam[4*ep->index];
 
-	endpointBufferAlloc(ep, 0, txBufSize);
-	endpointBufferAlloc(ep, 1, rxBufSize);
-
 	endpointFastPathConfigureNextBuffer(ep, 0, 0);
 	endpointFastPathConfigureNextBuffer(ep, 1, 0);
+#endif
+
 	ctrl->endpointIndex++;
 
 	endpointStateSet(ep, USBEP_STATE_NAK, USBEP_STATE_NAK);
@@ -433,7 +423,9 @@ uint8_t USBEndpointReceive(USBEndpoint* ep, USBEndpointBuffer* buf){
 	__disable_irq();
 	ep->rxBufNumActive++;
 
+#ifdef CONFIG_USB_HAL_STM32_USE_FASTPATH
 	endpointFastPathConfigureNextBuffer(ep, 1, ep->rxBufNumActive >= 2);
+#endif
 
 	if(ep->rxBufNumActive == 1){
 		USBEndpointReceiveSetState(ep, USBEP_STATE_VALID);
@@ -454,38 +446,6 @@ uint8_t USBEndpointReceiveGetData(USBEndpoint* ep, USBEndpointBuffer* buf){
 
 	return 0;
 }
-
-
-/*uint8_t USBEndpointReceive(USBEndpoint*  ep, USBReceiveCallback cb, void* param){
-	if (ep->type == USBEP_TYPE_INVALID){
-		return 1;
-	}
-
-	__disable_irq();
-	if(ep->rxBufNumActive == ep->trxBufNum[1]){
-		ep->rxCbParam = param;
-		ep->rxCb = cb;
-	}else{
-		ep->rxBufNumActive++;
-
-		endpointFastPathConfigureNextBuffer(ep, 1, ep->rxBufNumActive >= 2);
-
-		if(ep->rxBufNumActive == 1){
-			USBEndpointReceiveSetState(ep, USBEP_STATE_VALID);
-		}
-
-		//TODO: call CB somehow
-		//cb(buf->len, param);
-	}
-	__enable_irq();
-
-	ep->rxCbParam = param;
-	ep->rxCb = cb;
-
-	endpointStateSet(ep, USBEP_STATE_VALID, USBEP_STATE_UNCHANGED);*/
-
-/*	return 0;
-}*/
 
 uint8_t USBEndpointTransmit(USBEndpoint* ep, USBEndpointBuffer* buf, USBTransmitCallback cb, void* param){
 	if (ep->type == USBEP_TYPE_INVALID){
@@ -541,7 +501,9 @@ uint8_t USBEndpointTransmit(USBEndpoint* ep, USBEndpointBuffer* buf, USBTransmit
 	__disable_irq();
 	ep->txBufNumActive++;
 
+#ifdef CONFIG_USB_HAL_STM32_USE_FASTPATH
 	endpointFastPathConfigureNextBuffer(ep, 0, ep->txBufNumActive >= 2);
+#endif
 
 	if(ep->txBufNumActive == 1){
 		endpointBufferSetTXLen(ep, buf->len);

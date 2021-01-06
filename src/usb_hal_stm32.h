@@ -13,6 +13,7 @@
 
 #define CONFIG_USB_HAL_STM32_MAX_BUFFERS 6
 #define CONFIG_USB_HAL_STM32_MAX_ENDPOINTS 2
+#define CONFIG_USB_HAL_STM32_USE_FASTPATH
 
 typedef struct usbEndpoint{
 	USBController* ctrl;
@@ -39,24 +40,21 @@ typedef struct usbEndpoint{
 	volatile uint8_t     rxBufNumActive;
 	USBEndpointBuffer*   rxBuf[CONFIG_USB_HAL_STM32_MAX_BUFFERS];
 
-//	volatile uint16_t*   trxBufUpdatePointer;
-//	uint16_t             trxBufUpdateValue[2];
-//	uint32_t             trxBufUpdateFastPath[2];
-//	uint16_t		     txBufNextLen;
-
 	USBTransmitCallback txCb;
 	void* txCbParam;
 } USBEndpoint;
 
 typedef struct usbController {
+#ifdef CONFIG_USB_HAL_STM32_USE_FASTPATH
 	/* This data is used by the code in the interrupt handler to update the buffer ASAP */
 	uint32_t trxFastPathArray[CONFIG_USB_HAL_STM32_MAX_ENDPOINTS*4];
+#endif
 
 	USB_TypeDef* usbDevice;
 
-	volatile uint16_t* bufferRam;// = (uint16_t*)0x40006000;
-	uint16_t  bufferRamIndex;// = 64;
-	uint16_t  bufferRamSize;// = 1024;
+	volatile uint16_t* bufferRam;
+	uint16_t  bufferRamIndex;
+	uint16_t  bufferRamSize;
 
 	uint8_t endpointIndex;
 	USBEndpoint endpoints[CONFIG_USB_HAL_STM32_MAX_ENDPOINTS];

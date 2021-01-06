@@ -220,9 +220,7 @@ USBEndpoint* eptx;
 
  void resetHandler(USBController* ctrl){
 	 USBControlReset(&usbcontrol, ctrl);
-
 	 rxIndex=0;
-
 	 eptx = USBControllerEndpointAlloc(ctrl, 1, USBEP_TYPE_BULK, 64, 6, 64, 6);
 	// USBEndpoint* ep = USBControllerEndpointAlloc(ctrl, 1, USBEP_TYPE_BULK, 64, 0, 64, 3);
 
@@ -269,7 +267,6 @@ int main(){
 	USBControllerInit(&stm32usb);
 	halDelay(200);
 	USBControllerStart(&stm32usb, resetHandler);
-
 
 //	endpointPrintBuffer(0,1,0);}
 	int i = 0;
@@ -326,7 +323,7 @@ int main(){
 		//	 halUartHex16(CRS->CR);
 			// halUartSend(' ');
 			 //halUartHex16(CRS->ISR);
-
+			continue;
 			 if(i>10000){
 				 CRS->ICR = 0xF;
 				 i=0;
